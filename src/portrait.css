@@ -1,0 +1,9 @@
+.hero {
+  background-image: linear-gradient(90deg, rgba(5, 11, 17, .98), rgba(5, 11, 17, .88) 36%, rgba(5, 11, 17, .12) 72%), url('/lenny-upright-bass-portrait.png');
+}
+
+@media (max-width: 850px) {
+  .hero {
+    background-image: linear-gradient(90deg, rgba(5, 11, 17, .97), rgba(5, 11, 17, .52)), url('/lenny-upright-bass-portrait.png');
+  }
+}
