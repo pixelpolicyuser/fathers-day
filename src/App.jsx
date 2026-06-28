@@ -10,6 +10,58 @@ const sounds = [
   ['⌂', 'Basement Sessions', 'The best seat is saved.'],
 ]
 
+const tunerStrings = {
+  bass: [
+    { label: 'E1', name: 'E', frequency: 41.2 },
+    { label: 'A1', name: 'A', frequency: 55 },
+    { label: 'D2', name: 'D', frequency: 73.42 },
+    { label: 'G2', name: 'G', frequency: 98 },
+  ],
+  guitar: [
+    { label: 'E2', name: 'Low E', frequency: 82.41 },
+    { label: 'A2', name: 'A', frequency: 110 },
+    { label: 'D3', name: 'D', frequency: 146.83 },
+    { label: 'G3', name: 'G', frequency: 196 },
+    { label: 'B3', name: 'B', frequency: 246.94 },
+    { label: 'E4', name: 'High E', frequency: 329.63 },
+  ],
+}
+
+const noteNames = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B']
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
+const centsBetween = (frequency, target) => Math.round(1200 * Math.log2(frequency / target))
+const noteFromFrequency = frequency => {
+  const midi = Math.round(69 + 12 * Math.log2(frequency / 440))
+  const note = noteNames[((midi % 12) + 12) % 12]
+  const octave = Math.floor(midi / 12) - 1
+  return `${note}${octave}`
+}
+
+const detectPitch = (buffer, sampleRate) => {
+  let sum = 0
+  for (const sample of buffer) sum += sample * sample
+  if (Math.sqrt(sum / buffer.length) < .012) return null
+
+  let bestLag = -1
+  let bestCorrelation = 0
+  const minLag = Math.floor(sampleRate / 1000)
+  const maxLag = Math.min(Math.floor(sampleRate / 35), Math.floor(buffer.length / 2))
+
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let difference = 0
+    const limit = buffer.length - lag
+    for (let i = 0; i < limit; i++) difference += Math.abs(buffer[i] - buffer[i + lag])
+    const correlation = 1 - difference / limit
+    if (correlation > bestCorrelation) {
+      bestCorrelation = correlation
+      bestLag = lag
+    }
+  }
+
+  if (bestCorrelation < .55 || bestLag < 0) return null
+  return sampleRate / bestLag
+}
+
 const impulse = (ctx, room) => {
   const n = Math.floor(ctx.sampleRate * (.3 + room * .024))
   const b = ctx.createBuffer(2, n, ctx.sampleRate)
@@ -38,10 +90,22 @@ export default function App() {
   const [echo, setEcho] = useState(16)
   const [room, setRoom] = useState(24)
   const [pitch, setPitch] = useState(0)
+  const [tunerMode, setTunerMode] = useState('bass')
+  const [targetIndex, setTargetIndex] = useState(0)
+  const [tunerRunning, setTunerRunning] = useState(false)
+  const [tunerStatus, setTunerStatus] = useState('Pick an instrument, tap Start Tuner, then play one open string at a time.')
+  const [tunerReadout, setTunerReadout] = useState({ note: '—', frequency: null, cents: 0, direction: 'Ready' })
   const rec = useRef()
   const audio = useRef()
   const ctx = useRef()
   const nodes = useRef()
+  const tunerCtx = useRef()
+  const tunerAnalyser = useRef()
+  const tunerStream = useRef()
+  const tunerRaf = useRef()
+  const tunerBuffer = useRef()
+  const tunerModeRef = useRef(tunerMode)
+  const targetIndexRef = useRef(targetIndex)
 
   useEffect(() => {
     if (!blob) return
@@ -49,6 +113,101 @@ export default function App() {
     setUrl(next)
     return () => URL.revokeObjectURL(next)
   }, [blob])
+
+  useEffect(() => {
+    tunerModeRef.current = tunerMode
+    targetIndexRef.current = targetIndex
+  }, [tunerMode, targetIndex])
+
+  const stopTuner = ({ silent = false } = {}) => {
+    if (tunerRaf.current) cancelAnimationFrame(tunerRaf.current)
+    tunerRaf.current = null
+    tunerStream.current?.getTracks().forEach(track => track.stop())
+    tunerStream.current = null
+    tunerCtx.current?.close()
+    tunerCtx.current = null
+    tunerAnalyser.current = null
+    tunerBuffer.current = null
+    if (!silent) {
+      setTunerRunning(false)
+      setTunerStatus('Tuner stopped. Tap Start Tuner when you want to listen again.')
+    }
+  }
+
+  useEffect(() => () => stopTuner({ silent: true }), [])
+
+  const startTuner = async () => {
+    if (recording) {
+      setTunerStatus('Finish the recorder first, then start the tuner.')
+      return
+    }
+
+    try {
+      const C = window.AudioContext || window.webkitAudioContext
+      if (!C) throw new Error('AudioContext unavailable')
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      })
+      const context = new C()
+      const analyser = context.createAnalyser()
+      analyser.fftSize = 8192
+      analyser.smoothingTimeConstant = .32
+      context.createMediaStreamSource(stream).connect(analyser)
+
+      tunerCtx.current = context
+      tunerStream.current = stream
+      tunerAnalyser.current = analyser
+      tunerBuffer.current = new Float32Array(analyser.fftSize)
+      setTunerRunning(true)
+      setTunerStatus('Listening now. Play the selected open string nice and steady.')
+
+      const listen = () => {
+        const activeAnalyser = tunerAnalyser.current
+        const activeBuffer = tunerBuffer.current
+        if (!activeAnalyser || !activeBuffer) return
+
+        activeAnalyser.getFloatTimeDomainData(activeBuffer)
+        const frequency = detectPitch(activeBuffer, tunerCtx.current.sampleRate)
+        const target = tunerStrings[tunerModeRef.current][targetIndexRef.current]
+
+        if (frequency) {
+          const cents = clamp(centsBetween(frequency, target.frequency), -50, 50)
+          const direction = Math.abs(cents) <= 5 ? 'In tune' : cents < 0 ? 'Too low' : 'Too high'
+          setTunerReadout({
+            note: noteFromFrequency(frequency),
+            frequency,
+            cents,
+            direction,
+          })
+        } else {
+          setTunerReadout(current => ({
+            ...current,
+            direction: 'Play a little louder',
+            frequency: null,
+          }))
+        }
+
+        tunerRaf.current = requestAnimationFrame(listen)
+      }
+
+      listen()
+    } catch {
+      setTunerRunning(false)
+      setTunerStatus('The tuner needs microphone permission. On Android Chrome, allow the microphone when asked.')
+    }
+  }
+
+  const chooseTunerMode = mode => {
+    setTunerMode(mode)
+    setTargetIndex(0)
+    setTunerReadout({ note: '—', frequency: null, cents: 0, direction: 'Ready' })
+    setTunerStatus(`Ready for ${mode === 'bass' ? 'Bass Guitar' : 'Six String Guitar'}. Tap Start Tuner when you want to listen.`)
+  }
 
   const graph = () => {
     if (nodes.current) return nodes.current
@@ -96,6 +255,7 @@ export default function App() {
     }
 
     try {
+      if (tunerRunning) stopTuner()
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       const r = new MediaRecorder(stream)
       const chunks = []
@@ -175,12 +335,17 @@ export default function App() {
     setStatus(`Opening a ${instrumentName} chord-chart search in a new tab. Check the page terms before saving or printing.`)
   }
 
+  const activeStrings = tunerStrings[tunerMode]
+  const targetString = activeStrings[targetIndex] || activeStrings[0]
+  const needleLeft = `${50 + tunerReadout.cents}%`
+
   return (
     <main>
       <header>
         <a className="brand" href="#home"><span>♩</span> Lenny’s <em>Music Room</em></a>
         <nav>
           <a href="#player">Player</a>
+          <a href="#tuner">Tuner</a>
           <a href="#sound">Lenny’s Sound</a>
           <a href="#charts">Find a chart</a>
         </nav>
@@ -219,6 +384,63 @@ export default function App() {
           <Knob title="Room" value={room} set={setRoom} max="70" copy="Set the basement feel." />
           <Knob title="Pitch" value={pitch} set={setPitch} min="-8" max="8" copy="Move it up or down gently." output={pitch === 0 ? 'just right' : `${pitch > 0 ? '+' : ''}${pitch} steps`} />
         </section>
+      </section>
+
+      <section className="tuner" id="tuner" aria-labelledby="tuner-title">
+        <div className="tuner-copy">
+          <p className="eyebrow">Built for open strings</p>
+          <h2 id="tuner-title">Tune up before the next song.</h2>
+          <p>{tunerStatus}</p>
+          <div className="tuner-tabs" role="tablist" aria-label="Tuner instrument">
+            <button type="button" role="tab" aria-selected={tunerMode === 'bass'} className={tunerMode === 'bass' ? 'active' : ''} onClick={() => chooseTunerMode('bass')}>Bass Guitar</button>
+            <button type="button" role="tab" aria-selected={tunerMode === 'guitar'} className={tunerMode === 'guitar' ? 'active' : ''} onClick={() => chooseTunerMode('guitar')}>Six String Guitar</button>
+          </div>
+        </div>
+
+        <div className="tuner-panel">
+          <div className="string-row" aria-label="Choose a string">
+            {activeStrings.map((string, index) => (
+              <button type="button" key={string.label} className={index === targetIndex ? 'active' : ''} onClick={() => setTargetIndex(index)}>
+                <span>{string.name}</span>
+                <b>{string.label}</b>
+                <small>{string.frequency.toFixed(2)} Hz</small>
+              </button>
+            ))}
+          </div>
+
+          <div className="tuner-readout" aria-live="polite">
+            <span>Target</span>
+            <strong>{targetString.label}</strong>
+            <small>{targetString.frequency.toFixed(2)} Hz</small>
+          </div>
+
+          <div className="meter" aria-label={`Tuning meter: ${tunerReadout.direction}`}>
+            <span>♭</span>
+            <div className="meter-track">
+              <i style={{ left: needleLeft }} />
+              <b />
+            </div>
+            <span>♯</span>
+          </div>
+
+          <div className="detected">
+            <div>
+              <span>Detected</span>
+              <strong>{tunerReadout.note}</strong>
+              <small>{tunerReadout.frequency ? `${tunerReadout.frequency.toFixed(1)} Hz` : 'Waiting for a steady note'}</small>
+            </div>
+            <div>
+              <span>Status</span>
+              <strong>{tunerReadout.direction}</strong>
+              <small>{tunerReadout.frequency ? `${Math.abs(Math.round(tunerReadout.cents))} cents ${tunerReadout.cents < 0 ? 'flat' : tunerReadout.cents > 0 ? 'sharp' : 'centered'}` : '—'}</small>
+            </div>
+          </div>
+
+          <button className={'tuner-toggle ' + (tunerRunning ? 'listening' : '')} type="button" onClick={tunerRunning ? stopTuner : startTuner}>
+            {tunerRunning ? 'Stop Tuner' : 'Start Tuner'}
+          </button>
+          <p className="tuner-note">Tip: tune one open string at a time, close to the phone microphone. Your audio stays on this device.</p>
+        </div>
       </section>
 
       <section className="lower">
